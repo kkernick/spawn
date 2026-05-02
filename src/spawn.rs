@@ -16,7 +16,6 @@ use std::{
     env,
     ffi::{CString, NulError, OsString},
     io,
-    os::fd::OwnedFd,
     process::exit,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
@@ -30,7 +29,7 @@ use seccomp::filter::{self, Filter};
 #[cfg(feature = "fd")]
 use {
     nix::fcntl::{FcntlArg, FdFlag, fcntl},
-    std::os::fd::{AsRawFd, RawFd},
+    std::os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
 #[cfg(feature = "cache")]
@@ -64,6 +63,7 @@ pub enum Error {
     #[error("Fork error: {0}")]
     Fork(errno::Errno),
 
+    #[cfg(feature = "user")]
     /// An error for switching operating user
     #[error("User error: {0}")]
     User(#[from] user::Error),
@@ -735,6 +735,7 @@ impl Spawner {
         #[cfg(feature = "fd")]
         let fds = self.fds.into_inner();
 
+        #[allow(unused_mut, reason = "It needs to be mutable for elevate")]
         let mut cmd_c: Option<CString> = None;
         let mut args_c = Vec::new();
 

@@ -64,6 +64,7 @@ pub enum Error {
     #[error("Timeout")]
     Timeout,
 
+    #[cfg(feature = "user")]
     /// User switching errors.
     #[error("Failed to switch user: {0}")]
     User(user::Error),

@@ -63,7 +63,7 @@ The in-place and consuming variants of these functions can be used interchangeab
 ```rust
 let proxy = spawn::Spawner::abs("/usr/bin/bwrap")
 .name("proxy")
-.mode(user::Mode::Real).args([
+.args([
 		"--new-session",
 		"--ro-bind", "/usr/bin/xdg-dbus-proxy", "/usr/bin/xdg-dbus-proxy",
 ]);
