@@ -71,7 +71,7 @@ fn logger(level: log::Level, fd: OwnedFd, name: &str) {
 mod tests {
     use crate::{Spawner, StreamMode};
     use anyhow::Result;
-    use std::io::Write;
+    use std::{env, fs, io::Write, path::Path};
 
     #[test]
     fn bash() -> Result<()> {
@@ -83,7 +83,7 @@ mod tests {
             .spawn()?;
 
         let output = handle.output()?.read_blocking()?;
-        assert!(output.trim() == string);
+        assert_eq!(output.trim(), string);
         Ok(())
     }
 
@@ -99,7 +99,7 @@ mod tests {
         handle.close()?;
 
         let output = handle.output()?.read_blocking()?;
-        assert!(output.trim() == string);
+        assert_eq!(output.trim(), string);
         Ok(())
     }
 
@@ -113,7 +113,7 @@ mod tests {
 
         let bytes = handle.output()?.read_bytes(Some(string.len()));
         let output = String::from_utf8_lossy(&bytes);
-        assert!(output.trim() == string);
+        assert_eq!(output.trim(), string);
         Ok(())
     }
 
@@ -141,7 +141,23 @@ mod tests {
             .spawn()?;
 
         let output = handle.output()?.read_blocking()?;
-        assert!(output.trim() == user);
+        assert_eq!(output.trim(), user);
+        Ok(())
+    }
+
+    #[test]
+    fn change_dir() -> Result<()> {
+        let old = env::current_dir()?;
+        Spawner::new("bash")?
+            .args(["-c", "echo Hello > test.txt"])
+            .dir("/tmp")
+            .spawn()?
+            .wait()?;
+
+        let path = Path::new("/tmp/test.txt");
+        assert!(path.exists());
+        fs::remove_file(path)?;
+        assert_eq!(old, env::current_dir()?);
         Ok(())
     }
 }

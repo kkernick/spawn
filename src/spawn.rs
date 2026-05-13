@@ -16,6 +16,7 @@ use std::{
     env,
     ffi::{CString, NulError, OsString},
     io,
+    path::PathBuf,
     process::exit,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
@@ -135,6 +136,9 @@ pub struct Spawner {
     /// A unique name for the process, to be used to reference it by the Handle.
     unique_name: Mutex<Option<String>>,
 
+    /// A path to execute the command from
+    directory: Mutex<Option<PathBuf>>,
+
     /// Arguments
     args: Mutex<Vec<String>>,
 
@@ -204,6 +208,7 @@ impl Spawner {
         Self {
             cmd: cmd.into(),
             unique_name: Mutex::new(None),
+            directory: Mutex::new(None),
             args: Mutex::default(),
             input: Mutex::new(StreamMode::Share),
             output: Mutex::new(StreamMode::Share),
@@ -463,6 +468,17 @@ impl Spawner {
         self
     }
 
+    /// The directory to pivot into before executing the child.
+    /// This does not change the current directory of the parent.
+    /// It is run after changing users. If you are using the users
+    /// feature, this directory must be accessible by the desired
+    /// mode.
+    #[must_use]
+    pub fn dir(self, directory: impl Into<PathBuf>) -> Self {
+        self.dir_i(directory);
+        self
+    }
+
     /// Set the input flag without consuming the `Spawner`.
     pub fn input_i(&self, input: StreamMode) {
         *self.input.lock() = input;
@@ -605,6 +621,15 @@ impl Spawner {
         for s in args {
             a.push(s.into());
         }
+    }
+
+    /// The directory to pivot into before executing the child.
+    /// This does not change the current directory of the parent.
+    /// It is run after changing users. If you are using the users
+    /// feature, this directory must be accessible by the desired
+    /// mode.
+    pub fn dir_i(&self, directory: impl Into<PathBuf>) {
+        *self.directory.lock() = Some(directory.into());
     }
 
     /// Set the cache index.
@@ -932,6 +957,10 @@ impl Spawner {
                     && let Err(e) = user::drop(mode)
                 {
                     warn!("Failed to drop user: {e}");
+                }
+
+                if let Some(dir) = self.directory.into_inner() {
+                    let _ = env::set_current_dir(dir);
                 }
 
                 clear_capabilities(&diff);
