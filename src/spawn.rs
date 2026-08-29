@@ -17,7 +17,6 @@ use std::{
     ffi::{CString, NulError, OsString},
     io,
     path::PathBuf,
-    process::exit,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -63,6 +62,10 @@ pub enum Error {
     /// An error when trying to fork.
     #[error("Fork error: {0}")]
     Fork(errno::Errno),
+
+    /// An error when exec fails
+    #[error("Exec error: {0}")]
+    Exec(errno::Errno),
 
     #[cfg(feature = "user")]
     /// An error for switching operating user
@@ -981,9 +984,9 @@ impl Spawner {
                     filter.load();
                 }
 
-                // Execve
-                let _ = execve(&cmd_c, &args_c, &envs);
-                exit(-1);
+                // Execve. Note that the unwrap will never fail; either this child
+                // is replaced with the exec call, or it fails.
+                Err(Error::Exec(execve(&cmd_c, &args_c, &envs).unwrap_err()))
             }
         }
     }

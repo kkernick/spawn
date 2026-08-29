@@ -6,16 +6,14 @@ mod spawn;
 use caps::{CapSet, CapsHashSet};
 use log::warn;
 use nix::unistd::{dup, pipe};
-use std::fs::File;
-use std::os::fd::AsFd;
-use std::{os::fd::OwnedFd, sync::LazyLock};
+use std::{
+    fs::File,
+    os::fd::{AsFd, OwnedFd},
+    sync::LazyLock,
+};
 
-pub use handle::Error as HandleError;
-pub use handle::Handle;
-pub use handle::Stream;
-pub use spawn::Error as SpawnError;
-pub use spawn::Spawner;
-pub use spawn::StreamMode;
+pub use handle::{Error as HandleError, Handle, Stream};
+pub use spawn::{Error as SpawnError, Spawner, StreamMode};
 
 /// An `OwnedFd` pointing to /dev/null, duplicated for
 /// `StreamMode::Discard`.
@@ -25,16 +23,31 @@ static NULL: LazyLock<OwnedFd> = LazyLock::new(|| {
         .into()
 });
 
+/// The current processes' Ambient Set.
+static AMBIENT: LazyLock<CapsHashSet> =
+    LazyLock::new(|| caps::read(None, CapSet::Ambient).unwrap_or_default());
+
+/// The current processes' Effective Set.
+static EFFECTIVE: LazyLock<CapsHashSet> =
+    LazyLock::new(|| caps::read(None, CapSet::Effective).unwrap_or_default());
+
+/// The current processes' Inheritable Set.
+static INHERITABLE: LazyLock<CapsHashSet> =
+    LazyLock::new(|| caps::read(None, CapSet::Inheritable).unwrap_or_default());
+
+/// The current processes' Permitted Set.
+static PERMITTED: LazyLock<CapsHashSet> =
+    LazyLock::new(|| caps::read(None, CapSet::Permitted).unwrap_or_default());
+
 /// Clears the capabilities of the current thread.
 fn clear_capabilities(diff: &CapsHashSet) {
-    for set in [
-        CapSet::Ambient,
-        CapSet::Ambient,
-        CapSet::Effective,
-        CapSet::Inheritable,
-        CapSet::Permitted,
+    for (set, caps) in [
+        (CapSet::Ambient, AMBIENT.intersection(diff)),
+        (CapSet::Effective, EFFECTIVE.intersection(diff)),
+        (CapSet::Inheritable, INHERITABLE.intersection(diff)),
+        (CapSet::Permitted, PERMITTED.intersection(diff)),
     ] {
-        for cap in diff {
+        for cap in caps {
             if let Err(e) = caps::drop(None, set, *cap) {
                 warn!("Could not drop {cap}: {e}");
             }
