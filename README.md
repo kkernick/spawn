@@ -32,7 +32,6 @@ These three options take a `StreamMode` value, which can be:
 Other options include (With a `_i` variant for a non-consuming version):
 
 * `mode` (Requires `user` feature): Set the user mode of the child process. The Spawner utilizes `user::drop` to ensure the child cannot revert their user mode.
-* `elevate` (Requires `elevate` feature): Call the process with `pkexec` to prompt and provide administrative privilege. 
 * `seccomp` (Requires `seccomp` feature): Run the child under a specific SECCOMP Policy.
 * `associate`: Associate another process `Handle` to the `Spawner`, such that they are dropped together.
 * `cap`: Permit a capability in the child
@@ -114,7 +113,12 @@ The `Spawner` is entirely thread safe. It can be passed to multiple threads, and
 
 ### Spawning
 
-Once a process is ready to launch, `Spawner::spawn()` will consume the structure and return a `Handle`.
+Once a process is ready to launch, `Spawner::spawn()` will consume the structure and return a `Handle`. There are two implementation of actually creating the child:
+
+1. If advanced features are configured, specifically SECCOMP, arbitrary FD passthrough (i.e non-standard), `no-new-privileges`, capability restrictions, no `SetUID` mode dropping, and no directory changing, then `spawn` will use `posix_spawn`, which can be over 5X faster than the alternative implementation.
+2. For advanced functionality, a traditional `fork`/`exec` design is used.
+
+Which method is employed depends entirely on the arguments used to build the `Spawner`. You can see the chosen method either by viewing the `TRACE` level log, or `Handle::spawn_method`
 
 ## Handle
 
@@ -193,15 +197,20 @@ The `Handle` is almost entirely thread safe (Internally, the `Handle` is actuall
 * `wait_timeout` spawns a thread that raises a `SIGALRM` to interrupt the `wait` call after a defined period. It also uses signal handles for graceful response to a `SIGINT/TERM` (On top of `SIGALRM` and `SIGCHLD`), so cannot be used with threads.
 * `wait_blocking` is the only safe `wait` in threaded environments. It does not use signals. It cannot timeout. Therefore, it's inherently less safe than the above functions. A hung child will hang the parent, and signals will cause an abrupt termination that may leave the child as a zombie.
 
+## Which
+
+The `Spawner` has three ways to initialize the object:
+1. `Spawner::abs()` is an infallible method (Though it will fail at the `Spawner::spawn()` call if the path doesn’t actually exist, or doesn’t point to an executable).
+2. `Spawner::new()` will take a relative path and use the resolved path within your `PATH` environment variable, though it returns a `Result` in case that lookup fails.
+3. `Spawner::which()` takes a custom implementation of the `spawn::Which` trait and uses that to lookup the path. 
+
+The `Which` trait must only implement a function `which(&str) -> Result<Cow<'_, str>, WhichError>` to provide the resolved path, if possible. `Spawner::new()` simply uses `SpawnWhich`.
+
 ## Features
 
 ### `fd`
 
 The FD feature gates access to the `Spawner::fd`, `Spawner::fds`, and `Spawner::fd_arg` functions, along with their in-place versions. These functions allow you to pass a select set of File Descriptors to the child, ensuring that they will remain open and mapped to the same number.
-
-### `elevate`
-
-The Elevate feature gates the `Spawner::elevate` function, which prepends the command with `pkexec` to run it with administrative privilege. The program must be run under a user that can authorize such privilege via Pol-Kit.
 
 ### `cache`
 

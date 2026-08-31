@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["HandleError","SpawnError","StreamMode"],"struct":["Handle","Spawner","Stream"]};
+window.SIDEBAR_ITEMS = {"enum":["HandleError","Method","SpawnError","StreamMode","WhichError"],"struct":["Handle","SpawnWhich","Spawner","Stream"],"trait":["Which"]};

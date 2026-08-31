@@ -1,14 +1,21 @@
 //! Spawn subprocesses with more fine-grained control over File Descriptors,
 //! UID/GID, and File Stream handling.
 
-use crate::{clear_capabilities, cond_pipe, dup_null, handle::Handle, logger};
+use crate::{
+    NULL, clear_capabilities, cond_pipe,
+    handle::Handle,
+    logger,
+    which::{self, SpawnWhich, Which},
+};
 use caps::{Capability, CapsHashSet};
 use dashmap::{DashMap, DashSet, mapref::one::RefMut};
-use log::{trace, warn};
+use log::trace;
 use nix::{
     errno,
+    libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO},
+    spawn::{PosixSpawnAttr, PosixSpawnFileActions, posix_spawn},
     sys::{prctl, signal::Signal::SIGTERM},
-    unistd::{ForkResult, close, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork},
+    unistd::{ForkResult, Pid, close, dup, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork},
 };
 use parking_lot::Mutex;
 use std::{
@@ -16,24 +23,25 @@ use std::{
     env,
     ffi::{CString, NulError, OsString},
     io,
-    path::PathBuf,
+    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
     thread,
 };
 use thiserror::Error;
 
+#[cfg(feature = "user")]
+use user::Mode;
+
 #[cfg(feature = "seccomp")]
 use seccomp::filter::{self, Filter};
 
 #[cfg(feature = "fd")]
-use {
-    nix::fcntl::{FcntlArg, FdFlag, fcntl},
-    std::os::fd::{AsRawFd, OwnedFd, RawFd},
-};
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
 #[cfg(feature = "cache")]
-use std::{fs, path::Path};
+use std::fs;
 
 /// Errors related to the Spawner.
 #[derive(Debug, Error)]
@@ -52,8 +60,8 @@ pub enum Error {
     Io(#[from] io::Error),
 
     /// Errors to various functions that return `Errno`.
-    #[error("Spawn error within {0:?} failed to {1}: {2}")]
-    Errno(Option<ForkResult>, &'static str, errno::Errno),
+    #[error("Errno: {0}")]
+    Errno(#[from] errno::Errno),
 
     /// Errors resolving binary paths.
     #[error("Failed to resolve binary: {0}")]
@@ -104,6 +112,56 @@ pub enum StreamMode {
     #[cfg(feature = "fd")]
     /// Send the output to the provided File Descriptor.
     Fd(OwnedFd),
+}
+
+/// Values passed between the various spawn helpers.
+struct SpawnPackage {
+    /// The stdin pipe
+    pub stdin: Option<(OwnedFd, OwnedFd)>,
+
+    /// The stdout pipe
+    pub stdout: Option<(OwnedFd, OwnedFd)>,
+
+    /// The stderr pipe
+    pub stderr: Option<(OwnedFd, OwnedFd)>,
+
+    /// Our current stdin mode.
+    pub stdin_mode: StreamMode,
+
+    /// Our current stdout mode.
+    pub stdout_mode: StreamMode,
+
+    /// Our current stderr mode.
+    pub stderr_mode: StreamMode,
+
+    /// Arguments to the process.
+    pub args_c: Vec<CString>,
+
+    /// The environment of the process.
+    pub envs: Vec<CString>,
+
+    /// The unique name of the handle, if any
+    pub unique_name: Option<String>,
+
+    /// The command to run
+    pub cmd: String,
+
+    #[cfg(feature = "user")]
+    /// What operating mode to run under, if desired
+    pub mode: Option<Mode>,
+
+    /// Associated handles, if any.
+    pub associated: DashMap<String, Handle>,
+}
+
+/// How the child was spawned. Mostly for diagonstics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// Via `posix_spawn`
+    PosixSpawn,
+
+    /// Via `fork`/`exec`
+    ForkExec,
 }
 
 /// Spawn a child.
@@ -184,10 +242,6 @@ pub struct Spawner {
     #[cfg(feature = "user")]
     mode: Mutex<Option<user::Mode>>,
 
-    /// Use `pkexec` to elevate via *Polkit*.
-    #[cfg(feature = "elevate")]
-    elevate: AtomicBool,
-
     /// An optional *SECCOMP* policy to load on the child.
     #[cfg(feature = "seccomp")]
     seccomp: Mutex<Option<Filter>>,
@@ -199,8 +253,17 @@ impl Spawner {
     /// ## Errors
     /// If the path could not be found.
     pub fn new(cmd: impl Into<String>) -> Result<Self, Error> {
+        Self::which::<SpawnWhich>(cmd)
+    }
+
+    /// Construct a `Spawner` using a specialized `which` resolver.
+    ///
+    /// ## Errors
+    ///
+    /// If the path could not be found.
+    pub fn which<T: Which>(cmd: impl Into<String>) -> Result<Self, Error> {
         let cmd = cmd.into();
-        let path = which::which(&cmd)?;
+        let path = T::which(&cmd)?;
         Ok(Self::abs(path))
     }
 
@@ -231,9 +294,6 @@ impl Spawner {
 
             #[cfg(feature = "user")]
             mode: Mutex::default(),
-
-            #[cfg(feature = "elevate")]
-            elevate: AtomicBool::new(false),
 
             #[cfg(feature = "seccomp")]
             seccomp: Mutex::new(None),
@@ -297,17 +357,6 @@ impl Spawner {
     #[must_use]
     pub fn mode(self, mode: user::Mode) -> Self {
         self.mode_i(mode);
-        self
-    }
-
-    /// Elevate the child to root privilege by using polkit for authentication.
-    /// `pkexec` must exist, and must be in path.
-    /// The operating set of the child must ensure the real user can
-    /// authorize via polkit.
-    #[cfg(feature = "elevate")]
-    #[must_use]
-    pub fn elevate(self, elevate: bool) -> Self {
-        self.elevate_i(elevate);
         self
     }
 
@@ -495,12 +544,6 @@ impl Spawner {
     /// Set the error flag without consuming the `Spawner`.
     pub fn error_i(&self, error: StreamMode) {
         *self.error.lock() = error;
-    }
-
-    #[cfg(feature = "elevate")]
-    /// Set the elevate flag without consuming the `Spawner`.
-    pub fn elevate_i(&self, elevate: bool) {
-        self.elevate.store(elevate, Ordering::Relaxed);
     }
 
     /// Set the preserve environment flag without consuming the `Spawner`.
@@ -725,8 +768,114 @@ impl Spawner {
         Ok(())
     }
 
+    /// Manage the parent in a `spawn` call.
+    ///
+    /// This function runs after a child `Pid` has been acquired. In the fork/exec,
+    /// this is run within the parent arm (Hence the same). In `posix_spawn`, this
+    /// is run immediately after the `posix_spawn` call.
+    fn parent_arm(child: Pid, pkg: SpawnPackage, method: Method) -> Result<Handle, Error> {
+        let name = if let Some(name) = pkg.unique_name {
+            name
+        } else {
+            pkg.cmd
+        };
+
+        // Set the relevant pipes.
+        let stdin = if let Some((read, write)) = pkg.stdin {
+            close(read)?;
+            Some(write)
+        } else {
+            None
+        };
+
+        let stdout = if let Some((read, write)) = pkg.stdout {
+            close(write)?;
+            if let StreamMode::Log(log) = pkg.stdout_mode {
+                let name = name.clone();
+                let _ = thread::spawn(move || logger(log, read, &name));
+                None
+            } else {
+                Some(read)
+            }
+        } else {
+            None
+        };
+
+        let stderr = if let Some((read, write)) = pkg.stderr {
+            close(write)?;
+            if let StreamMode::Log(log) = pkg.stderr_mode {
+                let name = name.clone();
+                let _ = thread::spawn(move || logger(log, read, &name));
+                None
+            } else {
+                Some(read)
+            }
+        } else {
+            None
+        };
+
+        #[cfg(feature = "user")]
+        let mode = pkg.mode.unwrap_or(user::Mode::Existing);
+
+        let associated: Vec<Handle> = pkg.associated.into_iter().map(|(_, v)| v).collect();
+
+        // Return.
+        let handle = Handle::new(
+            name,
+            child,
+            #[cfg(feature = "user")]
+            mode,
+            stdin,
+            stdout,
+            stderr,
+            associated,
+            method,
+        );
+        Ok(handle)
+    }
+
+    /// Determine if we can use `posix_spawn`
+    ///
+    /// To use `posix_spawn`, we cannot use:
+    ///
+    /// 1. Any capabilities (If no caps are specified, capabilities are not dropped)
+    /// 2. No SECCOMP Filter
+    /// 3. No arbitrary FD passthrough
+    /// 4. No directory for child to start in
+    /// 5. No `no_new_privileges` set
+    /// 6. No user mode.
+    fn can_posix(&self) -> bool {
+        #[cfg(feature = "user")]
+        let user = self.mode.lock().is_none();
+
+        #[cfg(not(feature = "user"))]
+        let user = true;
+
+        #[cfg(feature = "seccomp")]
+        let seccomp = self.seccomp.lock().is_none();
+
+        #[cfg(not(feature = "seccomp"))]
+        let seccomp = true;
+
+        #[cfg(feature = "fd")]
+        let fds = self.fds.lock().is_empty();
+
+        #[cfg(not(feature = "fd"))]
+        let fds = true;
+
+        self.whitelist.is_empty()
+            && seccomp
+            && fds
+            && self.directory.lock().is_none()
+            && self.no_new_privileges.load(Ordering::Relaxed)
+            && user
+    }
+
     /// Spawn the child process.
     /// This consumes the structure, returning a `spawn::Handle`.
+    ///
+    /// This function will either use a traditional fork/exec, or `posix_spawn`, depending on how the handle
+    /// is configured, and what is faster.
     ///
     /// ## Errors
     /// This function can fail for many reasons--pretty much every error type defined in
@@ -742,15 +891,9 @@ impl Spawner {
     ///
     /// In other words, unless you are actively trying to cause an error, this function will not
     /// throw one.
-    ///
-    /// ## Panics
-    /// This function can panic if /dev/null cannot be duplicated, and Discard is used for a stream.
-    #[allow(clippy::too_many_lines, clippy::unwrap_used)]
+    #[allow(clippy::too_many_lines, clippy::arithmetic_side_effects)]
     pub fn spawn(mut self) -> Result<Handle, Error> {
-        // Create our pipes based on whether we need t
-        // hem.
-        // Because we use these conditionals later on when using them,
-        // we can unwrap() with impunity.
+        let can_posix = self.can_posix();
 
         let stdout_mode = self.output.into_inner();
         let stderr_mode = self.error.into_inner();
@@ -760,55 +903,32 @@ impl Spawner {
         let stderr = cond_pipe(&stderr_mode)?;
         let stdin = cond_pipe(&stdin_mode)?;
 
-        #[cfg(feature = "fd")]
-        let fds = self.fds.into_inner();
+        let args = self.args.into_inner();
+        let associated = self.associated;
 
-        #[allow(unused_mut, reason = "It needs to be mutable for elevate")]
-        let mut cmd_c: Option<CString> = None;
-        let mut args_c = Vec::new();
+        #[cfg(feature = "user")]
+        let mode = self.mode.into_inner();
 
-        // Launch with pkexec if we're elevated.
-        #[cfg(feature = "elevate")]
-        if self.elevate.load(Ordering::Relaxed) {
-            let polkit = CString::new("/usr/bin/pkexec".to_owned())?;
-            if cmd_c.is_none() {
-                cmd_c = Some(polkit.clone());
-            }
-            args_c.push(polkit);
-        }
+        let unique_name = self.unique_name.into_inner();
+        let cmd = self.cmd;
 
-        let resolved = CString::new(self.cmd.clone())?;
-        let cmd_c = cmd_c.unwrap_or_else(|| resolved.clone());
+        let mut args_c = Vec::with_capacity(args.len() + 1);
+        args_c.push(CString::new(cmd.as_str())?);
 
-        args_c.push(resolved);
-        self.args
-            .into_inner()
-            .into_iter()
-            .try_for_each(|arg| -> Result<(), Error> {
-                args_c.push(CString::from_str(&arg)?);
-                Ok(())
-            })?;
-
-        // Clear F_SETFD to allow passed FD's to persist after execve
-        #[cfg(feature = "fd")]
-        for fd in &fds {
-            let _ = fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty()))
-                .map_err(|e| Error::Errno(None, "fnctl fd", e))?;
+        for arg in args {
+            args_c.push(CString::from_str(&arg)?);
         }
 
         if self.preserve_env.load(Ordering::Relaxed) {
             let environment: HashMap<_, _> = env::vars_os()
                 .filter_map(|(key, value)| {
-                    if let Ok(key) = key.into_string()
-                        && let Ok(value) = value.into_string()
-                    {
-                        if self.env.contains_key(&key) {
-                            None
-                        } else {
-                            Some((key, value))
-                        }
-                    } else {
+                    let key = key.into_string().ok()?;
+                    let value = value.into_string().ok()?;
+
+                    if self.env.contains_key(&key) {
                         None
+                    } else {
+                        Some((key, value))
                     }
                 })
                 .collect();
@@ -824,154 +944,152 @@ impl Spawner {
 
         // Log if desired.
         if log::log_enabled!(log::Level::Trace) {
+            let method = if can_posix {
+                "posix_spawn"
+            } else {
+                "fork/exec"
+            };
+
             let formatted = args_c
                 .iter()
                 .map(|e| e.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join(" ");
+
             if self.preserve_env.load(Ordering::Relaxed) {
-                trace!("[SYSTEM ENVIRONMENT] {formatted}");
+                trace!("[SYSTEM ENVIRONMENT] ({method}) {formatted}");
             } else if !envs.is_empty() {
                 let env_formatted = envs
                     .iter()
                     .map(|e| e.to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(" ");
-                trace!("{env_formatted} {formatted}");
+
+                trace!("({method}) {env_formatted} {formatted}");
             } else {
-                trace!("{formatted}");
+                trace!("({method}) {formatted}");
             }
         }
 
-        let all = caps::all();
-        let set: HashSet<Capability> = self.whitelist.into_iter().collect();
-        let diff: CapsHashSet = all.difference(&set).copied().collect();
+        let pkg = SpawnPackage {
+            stdin,
+            stdout,
+            stderr,
+            stdin_mode,
+            stdout_mode,
+            stderr_mode,
+            args_c,
+            envs,
+            unique_name,
+            cmd,
 
-        #[cfg(feature = "seccomp")]
-        let filter = {
-            let mut filter = self.seccomp.into_inner();
-            if let Some(filter) = &mut filter {
-                filter.setup()?;
-            }
-            filter
+            #[cfg(feature = "user")]
+            mode,
+
+            associated,
         };
+
+        if can_posix {
+            Self::posix_spawn(pkg)
+        } else {
+            Self::fork_exec(
+                pkg,
+                &self.whitelist.into_iter().collect(),
+                #[cfg(feature = "seccomp")]
+                {
+                    let mut filter = self.seccomp.into_inner();
+                    if let Some(filter) = &mut filter {
+                        filter.setup()?;
+                    }
+                    filter
+                },
+                // Clear F_SETFD to allow passed FD's to persist after execve
+                #[cfg(feature = "fd")]
+                &self.fds.into_inner(),
+                self.directory.into_inner(),
+                &self.no_new_privileges,
+            )
+        }
+    }
+
+    /// Spawn the process with a traditional fork/exec
+    ///
+    /// This has the benefit of having more control--particularly SECCOMP, arbitrary FD preservation,
+    /// and capabilities, but *might* be slower than the `posix_spawn` mode.
+    ///
+    /// Which method is used depends on what features were enabled on the `Spawner`.
+    #[allow(clippy::unwrap_used, clippy::unreachable)]
+    fn fork_exec(
+        pkg: SpawnPackage,
+        set: &HashSet<Capability>,
+        #[cfg(feature = "seccomp")] filter: Option<Filter>,
+        #[cfg(feature = "fd")] fds: &Vec<OwnedFd>,
+        directory: Option<PathBuf>,
+        no_new_privileges: &AtomicBool,
+    ) -> Result<Handle, Error> {
+        let cmd_c = &pkg.args_c[0];
+
+        let all = caps::all();
+        let diff: CapsHashSet = all.difference(set).copied().collect();
 
         let fork = unsafe { fork() }.map_err(Error::Fork)?;
         match fork {
-            ForkResult::Parent { child } => {
-                let name = if let Some(name) = self.unique_name.into_inner() {
-                    name
-                } else {
-                    self.cmd
-                };
-
-                // Set the relevant pipes.
-                let stdin = if let Some((read, write)) = stdin {
-                    close(read).map_err(|e| Error::Errno(Some(fork), "close input", e))?;
-                    Some(write)
-                } else {
-                    None
-                };
-
-                let stdout = if let Some((read, write)) = stdout {
-                    close(write).map_err(|e| Error::Errno(Some(fork), "close error", e))?;
-                    if let StreamMode::Log(log) = stdout_mode {
-                        let name = name.clone();
-                        let _ = thread::spawn(move || logger(log, read, &name));
-                        None
-                    } else {
-                        Some(read)
-                    }
-                } else {
-                    None
-                };
-
-                let stderr = if let Some((read, write)) = stderr {
-                    close(write).map_err(|e| Error::Errno(Some(fork), "close output", e))?;
-                    if let StreamMode::Log(log) = stderr_mode {
-                        let name = name.clone();
-                        let _ = thread::spawn(move || logger(log, read, &name));
-                        None
-                    } else {
-                        Some(read)
-                    }
-                } else {
-                    None
-                };
-
-                #[cfg(feature = "user")]
-                let mode = self.mode.into_inner().unwrap_or(user::current()?);
-
-                let associated: Vec<Handle> = self.associated.into_iter().map(|(_, v)| v).collect();
-
-                // Return.
-                let handle = Handle::new(
-                    name,
-                    child,
-                    #[cfg(feature = "user")]
-                    mode,
-                    stdin,
-                    stdout,
-                    stderr,
-                    associated,
-                );
-                Ok(handle)
-            }
-
+            ForkResult::Parent { child } => Self::parent_arm(child, pkg, Method::ForkExec),
             ForkResult::Child => {
-                if let Some((read, write)) = stdin {
+                if let Some((read, write)) = pkg.stdin {
                     let _ = close(write);
                     let _ = dup2_stdin(read);
-                } else if matches!(stdin_mode, StreamMode::Discard) {
-                    let _ = dup2_stdin(dup_null().unwrap());
+                } else if matches!(pkg.stdin_mode, StreamMode::Discard) {
+                    let _ = dup2_stdin(dup(NULL.as_fd()).unwrap());
                 }
                 #[cfg(feature = "fd")]
-                if let StreamMode::Fd(fd) = stdin_mode {
+                if let StreamMode::Fd(fd) = pkg.stdin_mode {
                     let _ = dup2_stdin(fd);
                 }
 
-                if let Some((read, write)) = stdout {
+                if let Some((read, write)) = pkg.stdout {
                     let _ = close(read);
                     let _ = dup2_stdout(write);
-                } else if matches!(stdout_mode, StreamMode::Discard) {
-                    let _ = dup2_stdout(dup_null().unwrap());
+                } else if matches!(pkg.stdout_mode, StreamMode::Discard) {
+                    let _ = dup2_stdout(dup(NULL.as_fd()).unwrap());
                 }
                 #[cfg(feature = "fd")]
-                if let StreamMode::Fd(fd) = stdout_mode {
+                if let StreamMode::Fd(fd) = pkg.stdout_mode {
                     let _ = dup2_stdout(fd);
                 }
 
-                if let Some((read, write)) = stderr {
+                if let Some((read, write)) = pkg.stderr {
                     let _ = close(read);
                     let _ = dup2_stderr(write);
-                } else if matches!(stderr_mode, StreamMode::Discard) {
-                    let _ = dup2_stderr(dup_null().unwrap());
+                } else if matches!(pkg.stderr_mode, StreamMode::Discard) {
+                    let _ = dup2_stderr(dup(NULL.as_fd()).unwrap());
                 }
                 #[cfg(feature = "fd")]
-                if let StreamMode::Fd(fd) = stderr_mode {
+                if let StreamMode::Fd(fd) = pkg.stderr_mode {
                     let _ = dup2_stderr(fd);
+                }
+
+                #[cfg(feature = "fd")]
+                for fd in fds {
+                    let _ = fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty()))?;
                 }
 
                 let _ = prctl::set_pdeathsig(SIGTERM);
 
                 // Drop modes
                 #[cfg(feature = "user")]
-                if let Some(mode) = self.mode.into_inner()
-                    && let Err(e) = user::drop(mode)
-                {
-                    warn!("Failed to drop user: {e}");
+                if let Some(mode) = pkg.mode {
+                    assert!(user::drop(mode).is_ok());
                 }
 
-                if let Some(dir) = self.directory.into_inner() {
+                if let Some(dir) = directory {
                     let _ = env::set_current_dir(dir);
                 }
 
                 clear_capabilities(&diff);
 
-                if self.no_new_privileges.load(Ordering::Relaxed)
-                    && let Err(e) = prctl::set_no_new_privs()
-                {
-                    warn!("Could not set NO_NEW_PRIVS: {e}");
+                if no_new_privileges.load(Ordering::Relaxed) {
+                    assert!(prctl::set_no_new_privs().is_ok());
                 }
 
                 // Apply SECCOMP.
@@ -986,8 +1104,73 @@ impl Spawner {
 
                 // Execve. Note that the unwrap will never fail; either this child
                 // is replaced with the exec call, or it fails.
-                Err(Error::Exec(execve(&cmd_c, &args_c, &envs).unwrap_err()))
+                let _ = execve(cmd_c, &pkg.args_c, &pkg.envs);
+                unreachable!()
             }
         }
+    }
+
+    /// Spawns the process using `posix_spawn`.
+    ///
+    /// This mode is more limited in functionality, but avoids having to `fork` in userspace.
+    #[allow(clippy::too_many_lines, clippy::unwrap_used, clippy::unreachable)]
+    fn posix_spawn(pkg: SpawnPackage) -> Result<Handle, Error> {
+        let needs_null = matches!(pkg.stdin_mode, StreamMode::Discard)
+            || matches!(pkg.stdout_mode, StreamMode::Discard)
+            || matches!(pkg.stderr_mode, StreamMode::Discard);
+
+        let null = if needs_null {
+            Some(dup(NULL.as_fd())?)
+        } else {
+            None
+        };
+        let mut file_actions = PosixSpawnFileActions::init()?;
+
+        let stdin_fd = RawFd::from(STDIN_FILENO);
+        let stdout_fd = RawFd::from(STDOUT_FILENO);
+        let stderr_fd = RawFd::from(STDERR_FILENO);
+
+        if let Some((read, write)) = pkg.stdin.as_ref() {
+            file_actions.add_close(write.as_raw_fd())?;
+            file_actions.add_dup2(read.as_raw_fd(), stdin_fd)?;
+        } else if matches!(pkg.stdin_mode, StreamMode::Discard) {
+            file_actions.add_dup2(null.as_ref().unwrap().as_raw_fd(), stdin_fd)?;
+        }
+        #[cfg(feature = "fd")]
+        if let StreamMode::Fd(fd) = &pkg.stdin_mode {
+            file_actions.add_dup2(fd.as_raw_fd(), stdin_fd)?;
+        }
+
+        if let Some((read, write)) = pkg.stdout.as_ref() {
+            file_actions.add_close(read.as_raw_fd())?;
+            file_actions.add_dup2(write.as_raw_fd(), stdout_fd)?;
+        } else if matches!(pkg.stdout_mode, StreamMode::Discard) {
+            file_actions.add_dup2(null.as_ref().unwrap().as_raw_fd(), stdout_fd)?;
+        }
+        #[cfg(feature = "fd")]
+        if let StreamMode::Fd(fd) = &pkg.stdout_mode {
+            file_actions.add_dup2(fd.as_raw_fd(), stdout_fd)?;
+        }
+
+        if let Some((read, write)) = pkg.stderr.as_ref() {
+            file_actions.add_close(read.as_raw_fd())?;
+            file_actions.add_dup2(write.as_raw_fd(), stderr_fd)?;
+        } else if matches!(pkg.stderr_mode, StreamMode::Discard) {
+            file_actions.add_dup2(null.as_ref().unwrap().as_raw_fd(), stderr_fd)?;
+        }
+        #[cfg(feature = "fd")]
+        if let StreamMode::Fd(fd) = &pkg.stderr_mode {
+            file_actions.add_dup2(fd.as_raw_fd(), stderr_fd)?;
+        }
+
+        let attr = PosixSpawnAttr::init()?;
+        let child = posix_spawn(
+            Path::new(&pkg.cmd),
+            &file_actions,
+            &attr,
+            &pkg.args_c,
+            &pkg.envs,
+        )?;
+        Self::parent_arm(child, pkg, Method::PosixSpawn)
     }
 }

@@ -6,13 +6,11 @@ edition = "2024"
 [features]
 default = []
 fd = []
-elevate = []
 cache = []
 
 [dependencies]
 seccomp = { git = "https://github.com/kkernick/seccomp", optional = true, features = ["notify"] }
-user = { git = "https://github.com/kkernick/user", optional = true}
-which = { git = "https://github.com/kkernick/which" }
+user = { git = "https://github.com/kkernick/user", optional = true }
 
 caps = "0.5.6"
 dashmap = { version = "6.1.0", default-features = false }

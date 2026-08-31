@@ -3,6 +3,7 @@
 //! Spawner was configured to hook such descriptors), as well as mediating
 //! signal handling and teardown.
 
+use crate::spawn;
 use log::warn;
 use nix::{
     errno::Errno,
@@ -63,11 +64,6 @@ pub enum Error {
     /// Timeout error
     #[error("Timeout")]
     Timeout,
-
-    #[cfg(feature = "user")]
-    /// User switching errors.
-    #[error("Failed to switch user: {0}")]
-    User(user::Error),
 
     /// User switching errors.
     #[error("System Error: {0}")]
@@ -296,9 +292,17 @@ pub struct Handle {
     #[cfg(feature = "user")]
     /// The mode the process is running under, to ensure signals are sent with the correct permissions.
     mode: user::Mode,
+
+    /// How the child was spawned. This can be useful to ensure a particular security feature
+    /// was used, as `PosixSpawn` is faster, yet does not support certain features.
+    ///
+    /// While the mode selected will change to match the desired functionality, this
+    /// can be a useful/paranoid assurance.
+    method: spawn::Method,
 }
 impl Handle {
     /// Construct a new `Handle` from a Child PID and pipes
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         pid: Pid,
@@ -309,6 +313,8 @@ impl Handle {
         stdout: Option<OwnedFd>,
         stderr: Option<OwnedFd>,
         associates: Vec<Self>,
+
+        method: spawn::Method,
     ) -> Self {
         Self {
             name,
@@ -321,6 +327,8 @@ impl Handle {
 
             #[cfg(feature = "user")]
             mode,
+
+            method,
         }
     }
 
@@ -334,6 +342,12 @@ impl Handle {
     #[must_use]
     pub const fn pid(&self) -> &Option<Pid> {
         &self.child
+    }
+
+    /// How the child was spawned.
+    #[must_use]
+    pub const fn spawn_method(&self) -> spawn::Method {
+        self.method
     }
 
     /// Wait for the child to exit, with a timeout in case of no activity.
@@ -517,7 +531,7 @@ impl Handle {
             #[cfg(feature = "user")]
             let result = {
                 let mode = self.mode;
-                user::run_as!(mode, kill(pid, sig)).map_err(Error::User)?
+                user::run_as!(mode, kill(pid, sig))
             };
 
             #[cfg(not(feature = "user"))]
@@ -545,7 +559,7 @@ impl Handle {
             #[cfg(feature = "user")]
             let result = {
                 let mode = self.mode;
-                user::run_as!(mode, killpg(pid, sig)).map_err(Error::User)?
+                user::run_as!(mode, killpg(pid, sig))
             };
 
             #[cfg(not(feature = "user"))]

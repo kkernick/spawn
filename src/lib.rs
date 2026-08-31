@@ -2,18 +2,16 @@
 
 mod handle;
 mod spawn;
+mod which;
 
 use caps::{CapSet, CapsHashSet};
 use log::warn;
-use nix::unistd::{dup, pipe};
-use std::{
-    fs::File,
-    os::fd::{AsFd, OwnedFd},
-    sync::LazyLock,
-};
+use nix::unistd::pipe;
+use std::{fs::File, os::fd::OwnedFd, sync::LazyLock};
 
 pub use handle::{Error as HandleError, Handle, Stream};
-pub use spawn::{Error as SpawnError, Spawner, StreamMode};
+pub use spawn::{Error as SpawnError, Method, Spawner, StreamMode};
+pub use which::{Error as WhichError, SpawnWhich, Which};
 
 /// An `OwnedFd` pointing to /dev/null, duplicated for
 /// `StreamMode::Discard`.
@@ -55,19 +53,14 @@ fn clear_capabilities(diff: &CapsHashSet) {
     }
 }
 
-/// Create a duplicate FD pointing to /dev/null
-fn dup_null() -> Result<OwnedFd, SpawnError> {
-    dup(NULL.as_fd()).map_err(|e| SpawnError::Errno(None, "dup", e))
-}
-
 /// Conditionally create a pipe.
 /// Returns either a set of `None`, or the result of `pipe()`
 fn cond_pipe(cond: &StreamMode) -> Result<Option<(OwnedFd, OwnedFd)>, SpawnError> {
     match cond {
-        StreamMode::Pipe | StreamMode::Log(_) => match pipe() {
-            Ok((r, w)) => Ok(Some((r, w))),
-            Err(e) => Err(SpawnError::Errno(None, "pipe", e)),
-        },
+        StreamMode::Pipe | StreamMode::Log(_) => {
+            let (r, w) = pipe()?;
+            Ok(Some((r, w)))
+        }
         _ => Ok(None),
     }
 }
@@ -82,9 +75,14 @@ fn logger(level: log::Level, fd: OwnedFd, name: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Spawner, StreamMode};
+    use crate::{Spawner, StreamMode, spawn::Method};
     use anyhow::Result;
-    use std::{env, fs, io::Write, path::Path};
+    use std::{
+        env,
+        fs::{self},
+        io::Write,
+        path::{Path, PathBuf},
+    };
 
     #[test]
     fn bash() -> Result<()> {
@@ -171,6 +169,75 @@ mod tests {
         assert!(path.exists());
         fs::remove_file(path)?;
         assert_eq!(old, env::current_dir()?);
+        Ok(())
+    }
+
+    #[test]
+    fn posix_spawn() -> Result<()> {
+        let handle = Spawner::abs("/usr/bin/true").spawn()?;
+        assert!(handle.spawn_method() == Method::PosixSpawn);
+        handle.wait()?;
+
+        let handle = Spawner::abs("/usr/bin/true").new_privileges(true).spawn()?;
+        assert!(handle.spawn_method() == Method::ForkExec);
+        handle.wait()?;
+
+        let handle = Spawner::abs("/usr/bin/true")
+            .cap(caps::Capability::CAP_AUDIT_CONTROL)
+            .spawn()?;
+        assert!(handle.spawn_method() == Method::ForkExec);
+        handle.wait()?;
+
+        let handle = Spawner::abs("/usr/bin/true")
+            .dir(PathBuf::from("/"))
+            .spawn()?;
+        assert!(handle.spawn_method() == Method::ForkExec);
+        handle.wait()?;
+
+        #[cfg(feature = "fd")]
+        {
+            use std::fs::File;
+            use std::os::fd::OwnedFd;
+
+            let handle = Spawner::abs("/usr/bin/true")
+                .fd(OwnedFd::from(File::create("/tmp/file")?))
+                .spawn()?;
+            assert!(handle.spawn_method() == Method::ForkExec);
+            handle.wait()?;
+        }
+
+        #[cfg(feature = "seccomp")]
+        {
+            use seccomp::{action::Action, filter::Filter};
+            let filter = Filter::new(Action::Allow)?;
+            let handle = Spawner::abs("/usr/bin/true").seccomp(filter).spawn()?;
+            assert!(handle.spawn_method() == Method::ForkExec);
+            handle.wait()?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn bench() -> Result<()> {
+        use std::time::Instant;
+        let start = Instant::now();
+        for _i in 0..100 {
+            Spawner::abs("/usr/bin/true").spawn()?.wait()?;
+        }
+        let end = start.elapsed();
+        println!("POSIX: {}", end.as_millis());
+
+        let start = Instant::now();
+        for _i in 0..100 {
+            Spawner::abs("/usr/bin/true")
+                .new_privileges(true)
+                .spawn()?
+                .wait()?;
+        }
+        let end = start.elapsed();
+        println!("FORK/EXEC: {}", end.as_millis());
+
         Ok(())
     }
 }
