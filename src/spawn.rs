@@ -17,7 +17,7 @@ use nix::{
     sys::{prctl, signal::Signal::SIGTERM},
     unistd::{ForkResult, Pid, close, dup, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -36,6 +36,9 @@ use user::Mode;
 
 #[cfg(feature = "seccomp")]
 use seccomp::filter::{self, Filter};
+
+#[cfg(feature = "landlock")]
+use landlock::ruleset::Ruleset;
 
 #[cfg(feature = "fd")]
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -242,9 +245,13 @@ pub struct Spawner {
     #[cfg(feature = "user")]
     mode: Mutex<Option<user::Mode>>,
 
-    /// An optional *SECCOMP* policy to load on the child.
+    /// The SECCOMP filter to run under
     #[cfg(feature = "seccomp")]
     seccomp: Mutex<Option<Filter>>,
+
+    /// The Landlock policy to run under
+    #[cfg(feature = "landlock")]
+    landlock: Mutex<Option<Ruleset>>,
 }
 impl Spawner {
     /// Construct a `Spawner` to spawn *cmd*.
@@ -265,6 +272,11 @@ impl Spawner {
         let cmd = cmd.into();
         let path = T::which(&cmd)?;
         Ok(Self::abs(path))
+    }
+
+    /// Get the current arguments in the spawner.
+    pub fn get_args(&'_ self) -> MutexGuard<'_, Vec<String>> {
+        self.args.lock()
     }
 
     /// Construct a `Spanwner` to spawn *cmd*.
@@ -297,6 +309,9 @@ impl Spawner {
 
             #[cfg(feature = "seccomp")]
             seccomp: Mutex::new(None),
+
+            #[cfg(feature = "landlock")]
+            landlock: Mutex::new(None),
         }
     }
 
@@ -450,6 +465,15 @@ impl Spawner {
     #[must_use]
     pub fn seccomp(self, seccomp: Filter) -> Self {
         self.seccomp_i(seccomp);
+        self
+    }
+
+    #[cfg(feature = "landlock")]
+    /// Install a landlock ruleset to confine the child.
+    /// This is run before SECCOMP, but after everything else.
+    #[must_use]
+    pub fn landlock(self, landlock: Ruleset) -> Self {
+        self.landlock_i(landlock);
         self
     }
 
@@ -618,6 +642,12 @@ impl Spawner {
     #[cfg(feature = "seccomp")]
     pub fn seccomp_i(&self, seccomp: Filter) {
         *self.seccomp.lock() = Some(seccomp);
+    }
+
+    /// Set a *Landlock* filter without consuming the `Spawner`.
+    #[cfg(feature = "landlock")]
+    pub fn landlock_i(&self, landlock: Ruleset) {
+        *self.landlock.lock() = Some(landlock);
     }
 
     /// Move an argument to the `Spawner` in-place.
@@ -863,8 +893,15 @@ impl Spawner {
         #[cfg(not(feature = "fd"))]
         let fds = true;
 
+        #[cfg(feature = "landlock")]
+        let landlock = self.landlock.lock().is_none();
+
+        #[cfg(not(feature = "landlock"))]
+        let landlock = true;
+
         self.whitelist.is_empty()
             && seccomp
+            && landlock
             && fds
             && self.directory.lock().is_none()
             && self.no_new_privileges.load(Ordering::Relaxed)
@@ -1003,6 +1040,8 @@ impl Spawner {
                     }
                     filter
                 },
+                #[cfg(feature = "landlock")]
+                self.landlock.into_inner(),
                 // Clear F_SETFD to allow passed FD's to persist after execve
                 #[cfg(feature = "fd")]
                 &self.fds.into_inner(),
@@ -1018,11 +1057,12 @@ impl Spawner {
     /// and capabilities, but *might* be slower than the `posix_spawn` mode.
     ///
     /// Which method is used depends on what features were enabled on the `Spawner`.
-    #[allow(clippy::unwrap_used, clippy::unreachable)]
+    #[allow(clippy::unwrap_used, clippy::unreachable, unreachable_code)]
     fn fork_exec(
         pkg: SpawnPackage,
         set: &HashSet<Capability>,
         #[cfg(feature = "seccomp")] filter: Option<Filter>,
+        #[cfg(feature = "landlock")] landlock: Option<Ruleset>,
         #[cfg(feature = "fd")] fds: &Vec<OwnedFd>,
         directory: Option<PathBuf>,
         no_new_privileges: &AtomicBool,
@@ -1092,6 +1132,11 @@ impl Spawner {
                     assert!(prctl::set_no_new_privs().is_ok());
                 }
 
+                #[cfg(feature = "landlock")]
+                if let Some(landlock) = landlock {
+                    assert!(landlock.restrict().is_ok());
+                }
+
                 // Apply SECCOMP.
                 // Because we can't just trust the application is able/willing to
                 // apply a SECCOMP filter on it's own, we have to do it before the execve
@@ -1104,7 +1149,7 @@ impl Spawner {
 
                 // Execve. Note that the unwrap will never fail; either this child
                 // is replaced with the exec call, or it fails.
-                let _ = execve(cmd_c, &pkg.args_c, &pkg.envs);
+                execve(cmd_c, &pkg.args_c, &pkg.envs).expect("Failed to execute!");
                 unreachable!()
             }
         }

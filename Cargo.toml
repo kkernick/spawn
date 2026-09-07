@@ -10,6 +10,7 @@ cache = []
 
 [dependencies]
 seccomp = { git = "https://github.com/kkernick/seccomp", optional = true, features = ["notify"] }
+landlock = { git = "https://github.com/kkernick/landlock", optional = true, }
 user = { git = "https://github.com/kkernick/user", optional = true }
 
 caps = "0.5.6"

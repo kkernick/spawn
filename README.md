@@ -33,6 +33,7 @@ Other options include (With a `_i` variant for a non-consuming version):
 
 * `mode` (Requires `user` feature): Set the user mode of the child process. The Spawner utilizes `user::drop` to ensure the child cannot revert their user mode.
 * `seccomp` (Requires `seccomp` feature): Run the child under a specific SECCOMP Policy.
+* `landlock` (Requires `landlock` feature): Run the child under a specific Landlock Ruleset.
 * `associate`: Associate another process `Handle` to the `Spawner`, such that they are dropped together.
 * `cap`: Permit a capability in the child
 * `caps:` Permit a capability set for the child.
@@ -190,7 +191,7 @@ A `Handle` can be given a unique, memorable name via `Spawner::name`, which is u
 
 ### Waiting and Thread Safety
 
-The `Handle` is almost entirely thread safe (Internally, the `Handle` is actually two threads). However, you need to be cognizant of how you wait for the child process, as there are several options, and only some of them can be used in multithreaded environments.
+The `Handle` is almost entirely thread safe (Internally, the `Handle` is actually two threads). However, you need to be cognizant of how you wait for the child process, as there are several options, and only some of them can be used in multi-threaded environments.
 
 * `wait` is the basic, most useful implementation. It consumes the handle, waits for the child, and returns the exit code. To prevent locking the entire program, it uses a signal handle to wake up from signals like `SIGINT` allowing your program to gracefully exit. This makes it unsafe to use in threaded environments! 
 * `wait_and` operates identically to `wait` (The latter calls the former), but instead of consuming the Handle, simply waits for it to exit. You can still use the `Handle`, hence the name. It cannot be used in threaded environments.

@@ -240,4 +240,25 @@ mod tests {
 
         Ok(())
     }
+
+    #[cfg(feature = "seccomp")]
+    #[test]
+    fn seccomp() -> Result<()> {
+        use seccomp::{action::Action, filter::Filter};
+        let filter = Filter::new(Action::Allow)?;
+        let handle = Spawner::abs("/usr/bin/true").seccomp(filter).spawn()?;
+        handle.wait()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "landlock")]
+    #[test]
+    fn landlock() -> Result<()> {
+        use landlock::ruleset::{Filesystem, Ruleset};
+        let mut ruleset = Ruleset::new()?;
+        ruleset.add_fs(Filesystem::MakeDir)?;
+        let handle = Spawner::abs("/usr/bin/true").landlock(ruleset).spawn()?;
+        handle.wait()?;
+        Ok(())
+    }
 }

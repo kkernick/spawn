@@ -72,6 +72,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
+name = "landlock"
+version = "0.1.0"
+source = "git+https://github.com/kkernick/landlock#4f6e14a654c34dcd535c8cdd6432ba8a1081b8f4"
+dependencies = [
+ "log",
+ "nix",
+ "thiserror",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -208,6 +218,7 @@ dependencies = [
  "anyhow",
  "caps",
  "dashmap",
+ "landlock",
  "log",
  "nix",
  "parking_lot",
