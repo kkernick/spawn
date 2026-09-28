@@ -21,13 +21,10 @@ use std::{
     io::{self, Read, Write},
     os::fd::OwnedFd,
     sync::Arc,
-    thread::{JoinHandle, sleep},
+    thread::{self, sleep},
     time::Duration,
 };
 use thiserror::Error;
-
-#[cfg(not(feature = "rayon"))]
-use std::thread;
 
 /// Errors related to a `ProcessHandle`
 #[derive(Debug, Error)]
@@ -120,9 +117,6 @@ struct SharedBuffer {
 pub struct Stream {
     /// The shared buffer.
     shared: Arc<SharedBuffer>,
-
-    /// The worker.
-    thread: Option<JoinHandle<()>>,
 }
 
 impl Stream {
@@ -141,12 +135,7 @@ impl Stream {
         let thread_shared = Arc::clone(&shared);
 
         // Spawn the worker thread.
-        #[allow(
-            clippy::significant_drop_tightening,
-            unused_mut,
-            reason = "We want to hold onto the lock until we notify."
-        )]
-        let mut reader = move || {
+        thread::spawn(move || {
             let _ = (|| -> io::Result<()> {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -154,31 +143,17 @@ impl Stream {
                     if n == 0 {
                         break;
                     }
-                    let mut state = thread_shared.state.lock();
-                    state.buffer.extend(&buf[..n]);
+
+                    thread_shared.state.lock().buffer.extend(&buf[..n]);
                     let _ = thread_shared.condvar.notify_all();
                 }
                 Ok(())
             })();
 
-            let mut state = thread_shared.state.lock();
-            state.finished = true;
+            thread_shared.state.lock().finished = true;
             let _ = thread_shared.condvar.notify_all();
-        };
-
-        #[cfg(feature = "rayon")]
-        let handle = {
-            rayon::spawn(reader);
-            None
-        };
-
-        #[cfg(not(feature = "rayon"))]
-        let handle = Some(thread::spawn(move || reader()));
-
-        Self {
-            shared,
-            thread: handle,
-        }
+        });
+        Self { shared }
     }
 
     /// Drain the current contents of the buffer.
@@ -238,7 +213,7 @@ impl Stream {
     /// ## Errors
     /// `Error::Child`: If no child exists.
     pub fn read_blocking(&mut self) -> Result<String, Error> {
-        self.wait()?;
+        self.wait();
         let mut state = self.shared.state.lock();
         Ok(String::from_utf8_lossy(&Self::drain(&mut state, None)).into_owned())
     }
@@ -253,17 +228,20 @@ impl Stream {
     ///
     /// ## Errors
     /// `Error::Child`: If no child exists.
-    pub fn wait(&mut self) -> Result<(), Error> {
-        self.thread
-            .take()
-            .map_or(Ok(()), |handle| handle.join().map_err(|_| Error::Child))
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn wait(&mut self) {
+        loop {
+            let mut state = self.shared.state.lock();
+            if state.finished {
+                break;
+            }
+            self.shared.condvar.wait(&mut state);
+        }
     }
 }
 impl Drop for Stream {
     fn drop(&mut self) {
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
+        self.wait();
     }
 }
 
