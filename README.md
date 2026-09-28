@@ -222,3 +222,7 @@ The Cache feature gates control to the `Spawner::cache_read`, `Spawner::cache_wr
 The User feature gates control of the `Spawner::mode` function, which allows the child to be run under a specific operating mode for setuid applications, while also ensuring that cleanup and signal works within this privileged context. 
 
 If you are not using setuid, this feature is useless.
+
+### `rayon`
+
+The Rayon features uses the global thread pool instead of spawning threads for async stream capture and other thread uses. If you're already using `rayon`, this will likely improve performance, especially if you're spawning many processes and need to capture their output.
