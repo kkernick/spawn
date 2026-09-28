@@ -1,12 +1,13 @@
 [package]
 name = "spawn"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [features]
 default = []
 fd = []
 cache = []
+rayon = ["dep:rayon"]
 
 [dependencies]
 seccomp = { git = "https://github.com/kkernick/seccomp", optional = true, features = ["notify"] }
@@ -18,6 +19,7 @@ dashmap = { version = "6.1.0", default-features = false }
 log = { version = "0.4.27", default-features = false }
 nix = { version = "0.31.2", features = ["fs", "signal"], default-features = false }
 parking_lot = { version = "0.12.5", default-features = false }
+rayon = { version = "1.12.0", default-features = false, optional = true }
 signal-hook = { version = "0.4.4", features = ["iterator"], default-features = false }
 thiserror = { version = "2.0.17", default-features = false }
 

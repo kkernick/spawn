@@ -27,9 +27,11 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
-    thread,
 };
 use thiserror::Error;
+
+#[cfg(not(feature = "rayon"))]
+use std::thread;
 
 #[cfg(feature = "user")]
 use user::Mode;
@@ -157,7 +159,7 @@ struct SpawnPackage {
     pub associated: DashMap<String, Handle>,
 }
 
-/// How the child was spawned. Mostly for diagonstics.
+/// How the child was spawned. Mostly for diagnostics.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     /// Via `posix_spawn`
@@ -190,7 +192,7 @@ pub enum Method {
 /// let string = "Hello, World!";
 /// write!(handle, "{}", &string);
 /// handle.close();
-/// let output = handle.output().unwrap().read_blocking().unwrap();
+/// let output = handle.output().unwrap().read_line().unwrap();
 /// assert!(output == string);
 /// ```
 pub struct Spawner {
@@ -762,14 +764,15 @@ impl Spawner {
     #[cfg(feature = "cache")]
     #[allow(clippy::significant_drop_tightening)]
     pub fn cache_write(&self, path: &Path) -> Result<(), Error> {
-        use std::io::Write;
+        use std::io::{ErrorKind, Write};
         let mut index = self.cache_index.lock();
         if let Some(i) = *index {
             let args = self.args.lock();
             if let Some(parent) = path.parent()
-                && !parent.exists()
+                && let Err(e) = fs::create_dir(parent)
+                && e.kind() != ErrorKind::AlreadyExists
             {
-                fs::create_dir(parent)?;
+                return Err(e.into());
             }
             let mut file = fs::File::create(path)?;
             let bytes = args[i..].join(" ");
@@ -822,6 +825,10 @@ impl Spawner {
             close(write)?;
             if let StreamMode::Log(log) = pkg.stdout_mode {
                 let name = name.clone();
+                #[cfg(feature = "rayon")]
+                rayon::spawn(move || logger(log, read, &name));
+
+                #[cfg(not(feature = "rayon"))]
                 let _ = thread::spawn(move || logger(log, read, &name));
                 None
             } else {
@@ -835,6 +842,10 @@ impl Spawner {
             close(write)?;
             if let StreamMode::Log(log) = pkg.stderr_mode {
                 let name = name.clone();
+                #[cfg(feature = "rayon")]
+                rayon::spawn(move || logger(log, read, &name));
+
+                #[cfg(not(feature = "rayon"))]
                 let _ = thread::spawn(move || logger(log, read, &name));
                 None
             } else {

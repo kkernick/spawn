@@ -8,7 +8,7 @@ use log::warn;
 use nix::{
     errno::Errno,
     sys::{
-        signal::{Signal, kill, killpg, raise},
+        signal::{Signal, kill, raise},
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
     unistd::Pid,
@@ -21,10 +21,13 @@ use std::{
     io::{self, Read, Write},
     os::fd::OwnedFd,
     sync::Arc,
-    thread::{self, JoinHandle, sleep},
+    thread::{JoinHandle, sleep},
     time::Duration,
 };
 use thiserror::Error;
+
+#[cfg(not(feature = "rayon"))]
+use std::thread;
 
 /// Errors related to a `ProcessHandle`
 #[derive(Debug, Error)]
@@ -140,9 +143,10 @@ impl Stream {
         // Spawn the worker thread.
         #[allow(
             clippy::significant_drop_tightening,
+            unused_mut,
             reason = "We want to hold onto the lock until we notify."
         )]
-        let handle = thread::spawn(move || {
+        let mut reader = move || {
             let _ = (|| -> io::Result<()> {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -160,11 +164,20 @@ impl Stream {
             let mut state = thread_shared.state.lock();
             state.finished = true;
             let _ = thread_shared.condvar.notify_all();
-        });
+        };
+
+        #[cfg(feature = "rayon")]
+        let handle = {
+            rayon::spawn(reader);
+            None
+        };
+
+        #[cfg(not(feature = "rayon"))]
+        let handle = Some(thread::spawn(move || reader()));
 
         Self {
             shared,
-            thread: Some(handle),
+            thread: handle,
         }
     }
 
@@ -191,9 +204,8 @@ impl Stream {
         let mut state = self.shared.state.lock();
         loop {
             if let Some(pos) = state.buffer.iter().position(|&b| b == b'\n') {
-                let line =
-                    String::from_utf8_lossy(&Self::drain(&mut state, Some(pos))).into_owned();
-                return Some(line);
+                let line = &Self::drain(&mut state, Some(pos))[..pos];
+                return Some(String::from_utf8_lossy(line).into_owned());
             }
 
             if state.finished {
@@ -367,6 +379,13 @@ impl Handle {
                 signal::SIGALRM,
             ])?;
 
+            #[cfg(feature = "rayon")]
+            rayon::spawn(move || {
+                sleep(timeout);
+                let _ = raise(Signal::SIGALRM);
+            });
+
+            #[cfg(not(feature = "rayon"))]
             let _ = thread::spawn(move || {
                 sleep(timeout);
                 let _ = raise(Signal::SIGALRM);
@@ -403,7 +422,7 @@ impl Handle {
         }
     }
 
-    /// Wait for the child to exit.
+    /// Wait for the child to exit, without consuming the `Handle`.
     ///
     /// Note that this function uses a signal handler to ensure it does not
     /// hang the process. You cannot use this function in multi-threaded environments.
@@ -536,34 +555,6 @@ impl Handle {
 
             #[cfg(not(feature = "user"))]
             let result = kill(pid, sig);
-
-            match result {
-                Ok(()) => Ok(()),
-                Err(Errno::ESRCH) => {
-                    self.child = None;
-                    Ok(())
-                }
-                Err(e) => Err(Error::Comm(e)),
-            }
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Send the signal to the child, and all associated handles.
-    ///
-    /// ## Errors
-    /// `Error::Comm`: If `waitpid` returns an error
-    pub fn signal_group(&mut self, sig: Signal) -> Result<(), Error> {
-        if let Some(pid) = self.alive()? {
-            #[cfg(feature = "user")]
-            let result = {
-                let mode = self.mode;
-                user::run_as!(mode, killpg(pid, sig))
-            };
-
-            #[cfg(not(feature = "user"))]
-            let result = killpg(pid, sig);
 
             match result {
                 Ok(()) => Ok(()),

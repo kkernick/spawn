@@ -55,6 +55,7 @@ fn clear_capabilities(diff: &CapsHashSet) {
 
 /// Conditionally create a pipe.
 /// Returns either a set of `None`, or the result of `pipe()`
+#[inline]
 fn cond_pipe(cond: &StreamMode) -> Result<Option<(OwnedFd, OwnedFd)>, SpawnError> {
     match cond {
         StreamMode::Pipe | StreamMode::Log(_) => {
@@ -74,6 +75,7 @@ fn logger(level: log::Level, fd: OwnedFd, name: &str) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use crate::{Spawner, StreamMode, spawn::Method};
     use anyhow::Result;
@@ -93,7 +95,7 @@ mod tests {
             .error(StreamMode::Pipe)
             .spawn()?;
 
-        let output = handle.output()?.read_blocking()?;
+        let output = handle.output()?.read_line().unwrap();
         assert_eq!(output.trim(), string);
         Ok(())
     }
@@ -109,7 +111,7 @@ mod tests {
         write!(handle, "{string}")?;
         handle.close()?;
 
-        let output = handle.output()?.read_blocking()?;
+        let output = handle.output()?.read_line().unwrap();
         assert_eq!(output.trim(), string);
         Ok(())
     }
@@ -151,7 +153,7 @@ mod tests {
             .error(StreamMode::Pipe)
             .spawn()?;
 
-        let output = handle.output()?.read_blocking()?;
+        let output = handle.output()?.read_line().unwrap();
         assert_eq!(output.trim(), user);
         Ok(())
     }
@@ -256,7 +258,7 @@ mod tests {
     fn landlock() -> Result<()> {
         use landlock::ruleset::{Filesystem, Ruleset};
         let mut ruleset = Ruleset::new()?;
-        ruleset.add_fs(Filesystem::MakeDir)?;
+        ruleset.handled_fs(Filesystem::MakeDir)?;
         let handle = Spawner::abs("/usr/bin/true").landlock(ruleset).spawn()?;
         handle.wait()?;
         Ok(())

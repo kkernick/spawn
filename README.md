@@ -158,7 +158,7 @@ let string = "Hello, World!";
 write!(handle, "{string}").unwrap();
 handle.close().unwrap();
 
-let output = handle.output().unwrap().read_blocking().unwrap();
+let output = handle.output().unwrap().read_line().unwrap();
 assert!(output.trim() == string);
 ```
 
