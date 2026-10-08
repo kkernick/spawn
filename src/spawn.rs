@@ -826,7 +826,7 @@ impl Spawner {
             if let StreamMode::Log(log) = pkg.stdout_mode {
                 let name = name.clone();
                 #[cfg(feature = "rayon")]
-                rayon::spawn(move || logger(log, read, &name));
+                crate::SPAWNPOOL.spawn(move || logger(log, read, &name));
 
                 #[cfg(not(feature = "rayon"))]
                 let _ = thread::spawn(move || logger(log, read, &name));
@@ -843,7 +843,7 @@ impl Spawner {
             if let StreamMode::Log(log) = pkg.stderr_mode {
                 let name = name.clone();
                 #[cfg(feature = "rayon")]
-                rayon::spawn(move || logger(log, read, &name));
+                crate::SPAWNPOOL.spawn(move || logger(log, read, &name));
 
                 #[cfg(not(feature = "rayon"))]
                 let _ = thread::spawn(move || logger(log, read, &name));

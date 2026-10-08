@@ -21,7 +21,7 @@ use std::{
     io::{self, Read, Write},
     os::fd::OwnedFd,
     sync::Arc,
-    thread::{self, sleep},
+    thread::sleep,
     time::Duration,
 };
 use thiserror::Error;
@@ -133,9 +133,7 @@ impl Stream {
         });
 
         let thread_shared = Arc::clone(&shared);
-
-        // Spawn the worker thread.
-        thread::spawn(move || {
+        let worker = move || {
             let _ = (|| -> io::Result<()> {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -152,7 +150,14 @@ impl Stream {
 
             thread_shared.state.lock().finished = true;
             let _ = thread_shared.condvar.notify_all();
-        });
+        };
+
+        // Spawn the worker thread.
+        #[cfg(feature = "rayon")]
+        crate::SPAWNPOOL.spawn(worker);
+
+        #[cfg(not(feature = "rayon"))]
+        std::thread::spawn(worker);
         Self { shared }
     }
 
@@ -358,13 +363,13 @@ impl Handle {
             ])?;
 
             #[cfg(feature = "rayon")]
-            rayon::spawn(move || {
+            crate::SPAWNPOOL.spawn(move || {
                 sleep(timeout);
                 let _ = raise(Signal::SIGALRM);
             });
 
             #[cfg(not(feature = "rayon"))]
-            let _ = thread::spawn(move || {
+            let _ = std::thread::spawn(move || {
                 sleep(timeout);
                 let _ = raise(Signal::SIGALRM);
             });

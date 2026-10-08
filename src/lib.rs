@@ -21,6 +21,14 @@ static NULL: LazyLock<OwnedFd> = LazyLock::new(|| {
         .into()
 });
 
+/// Spawn's own thread pool to prevent exhausting the global pool
+#[cfg(feature = "rayon")]
+static SPAWNPOOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .build()
+        .expect("Failed to initialize spawn pool")
+});
+
 /// The current processes' Ambient Set.
 static AMBIENT: LazyLock<CapsHashSet> =
     LazyLock::new(|| caps::read(None, CapSet::Ambient).unwrap_or_default());
